@@ -1,0 +1,10 @@
+BasedOnStyle: LLVM
+LineEnding: LF
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+AccessModifierOffset: -4
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortBlocksOnASingleLine: Always
+AlignAfterOpenBracket: Align
