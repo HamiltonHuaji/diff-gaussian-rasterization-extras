@@ -508,24 +508,24 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
     const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
     float accum_rec[C] = {0};
-    float accum_red = 0;
     float accum_ren[3] = {0};
-    float accum_rea = 0;
     float accum_ree[MAX_EXTRA_DIMS] = {0};
     float dL_dpixel[C];
+    float accum_depth_rec = 0;
     float dL_dpixel_depth;
-    float dL_dpixel_norm[3];
+    float accum_alpha_rec = 0;
     float dL_dpixel_alpha;
+    float dL_dpixel_norm[3];
     float dL_dpixel_extra[MAX_EXTRA_DIMS];
     if (inside) {
         for (int i = 0; i < C; i++)
             dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-        dL_dpixel_depth = dL_dpixel_depths[pix_id];
         for (int i = 0; i < 3; i++)
             dL_dpixel_norm[i] = dL_dpixel_norms[i * H * W + pix_id];
-        dL_dpixel_alpha = dL_dpixel_alphas[pix_id];
         for (int i = 0; i < ED; i++)
             dL_dpixel_extra[i] = dL_dpixel_extras[i * H * W + pix_id];
+        dL_dpixel_depth = dL_dpixel_depths[pix_id];
+        dL_dpixel_alpha = dL_dpixel_alphas[pix_id];
     }
     float last_alpha = 0;
     float last_color[C] = {0};
@@ -550,9 +550,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
             collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
             for (int i = 0; i < C; i++)
                 collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+            collected_depths[block.thread_rank()] = depths[coll_id];
             for (int i = 0; i < 3; i++)
                 collected_norms[i * BLOCK_SIZE + block.thread_rank()] = norms[coll_id * 3 + i];
-            collected_depths[block.thread_rank()] = depths[coll_id];
             for (int i = 0; i < ED; i++)
                 collected_extras[i * BLOCK_SIZE + block.thread_rank()] = extras[coll_id * ED + i];
         }
@@ -581,8 +581,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
             T = T / (1.f - alpha);
             const float weight = alpha * T;
-            // const float dchannel_dcolor = alpha * T;
-            // const float dpixel_depth_ddepth = alpha * T;
+            const float dchannel_dcolor = alpha * T;
+            const float dpixel_depth_ddepth = alpha * T;
             // const float dpixel_norm_dnorm = alpha * T;
             // const float dpixel_extra_dextra = alpha * T;
 
@@ -602,14 +602,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
                 // Update the gradients w.r.t. color of the Gaussian.
                 // Atomic, since this pixel is just one of potentially
                 // many that were affected by this Gaussian.
-                atomicAdd(&(dL_dcolors[global_id * C + ch]), weight * dL_dchannel);
+                atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
             }
-            const float dep = collected_depths[j];
-            accum_red = last_alpha * last_depth + (1.f - last_alpha) * accum_red;
-            last_depth = dep;
-            dL_dalpha += (dep - accum_red) * dL_dpixel_depth;
-            atomicAdd(&(dL_ddepths[global_id]), weight * dL_dpixel_depth);
-
             for (int ch = 0; ch < 3; ch++) {
                 const float n = collected_norms[ch * BLOCK_SIZE + j];
                 // Update last norm (to be used in the next iteration)
@@ -638,10 +632,22 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
                 atomicAdd(&(dL_dextras[global_id * ED + ch]), weight * dL_dextrach);
             }
 
-            accum_rea = last_alpha + (1.f - last_alpha) * accum_rea;
-            dL_dalpha += (1 - accum_rea) * dL_dpixel_alpha;
+            // Propagate gradients from pixel depth to opacity
+            // Just replace color with depth
+            const float c_d = collected_depths[j];
+            accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+            // Update last depth (to be used in the next iteration)
+            last_depth = c_d;
+            dL_dalpha += (c_d - accum_depth_rec) * dL_dpixel_depth;
+            atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
+
+            // Propagate gradients from pixel alpha (weights_sum) to opacity
+            // Just replace color with 1.
+            accum_alpha_rec = last_alpha + (1.f - last_alpha) * accum_alpha_rec;
+            dL_dalpha += (1 - accum_alpha_rec) * dL_dpixel_alpha; //- (alpha - accum_alpha_rec) * dL_dpixel_alpha;
 
             dL_dalpha *= T;
+
             // Update last alpha (to be used in the next iteration)
             last_alpha = alpha;
 
@@ -651,9 +657,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
             for (int i = 0; i < C; i++)
                 bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
             dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-            // Set background depth value == 0, thus no contribution for
-            // dL_dalpha
 
             // Helpful reusable temporary variables
             const float dL_dG = con_o.w * dL_dalpha;
@@ -665,6 +668,10 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
             // Update gradients w.r.t. 2D mean position of the Gaussian
             atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
             atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+            const float abs_dL_dmean2D = abs(dL_dG * dG_ddelx * ddelx_dx) + abs(dL_dG * dG_ddely * ddely_dy);
+            atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
+            // TODO count stats
+            //  atomicAdd(&dL_dconic2D[global_id].z, 1.0f);
 
             // Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
             atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
